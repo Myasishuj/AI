@@ -1,0 +1,120 @@
+import pandas as pd
+import numpy as np
+import random
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_extraction.text import TfidfVectorizer
+import tensorflow as tf
+from tensorflow.keras import layers, models, optimizers
+import matplotlib.pyplot as plt
+
+# --- Hyperparameters ---
+EPOCHS = 10
+BATCH_SIZE = 32
+LEARNING_RATE = 0.001
+
+# --- Load dataset ---
+df = pd.read_csv("SocialMediaUsers_with_Recommendations.csv")
+
+# --- TF-IDF on Interests ---
+tfidf = TfidfVectorizer(max_features=100)
+X_tfidf = tfidf.fit_transform(df['Interests'].fillna(""))
+
+# --- Feature engineering functions ---
+def interest_similarity(u1, u2):
+    return cosine_similarity(X_tfidf[u1], X_tfidf[u2])[0, 0]
+
+def age_difference(u1, u2):
+    return abs(df.loc[u1, 'age'] - df.loc[u2, 'age'])
+
+def geo_distance(u1, u2):
+    lat1, lon1 = df.loc[u1, ['latitude', 'longitude']]
+    lat2, lon2 = df.loc[u2, ['latitude', 'longitude']]
+    return np.sqrt((lat1 - lat2)**2 + (lon1 - lon2)**2)
+
+# --- Generate training data ---
+samples = []
+labels = []
+n_samples = 20000
+random.seed(42)
+
+for _ in range(n_samples):
+    # Positive pair
+    u1 = random.randint(0, len(df) - 1)
+    friends_str = str(df.loc[u1, 'RecommendedFriends'])
+    friend_names = [name.strip() for name in friends_str.split(',') if name.strip()]
+    if friend_names:
+        try:
+            u2 = df[df['Name'].isin(friend_names)].sample(1).index[0]
+            samples.append([interest_similarity(u1, u2), age_difference(u1, u2), geo_distance(u1, u2)])
+            labels.append(1)
+        except:
+            continue
+
+    # Negative pair
+    u1 = random.randint(0, len(df) - 1)
+    u2 = random.randint(0, len(df) - 1)
+    if u1 != u2 and df.loc[u2, 'Name'] not in str(df.loc[u1, 'RecommendedFriends']):
+        samples.append([interest_similarity(u1, u2), age_difference(u1, u2), geo_distance(u1, u2)])
+        labels.append(0)
+
+# --- Prepare dataset ---
+X = np.array(samples)
+y = np.array(labels)
+
+scaler = StandardScaler()
+X = scaler.fit_transform(X)
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# --- Build neural network model ---
+model = models.Sequential([
+    layers.Input(shape=(3,)),
+    layers.Dense(32, activation='relu'),
+    layers.Dense(16, activation='relu'),
+    layers.Dense(1, activation='sigmoid')
+])
+
+optimizer = optimizers.Adam(learning_rate=LEARNING_RATE)
+model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy'])
+
+# --- Train the model ---
+print(f"\nTraining model with epochs={EPOCHS}, batch_size={BATCH_SIZE}, learning_rate={LEARNING_RATE}")
+history = model.fit(
+    X_train, y_train,
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    validation_split=0.1,
+    verbose=1
+)
+
+# --- Evaluate the model ---
+test_loss, test_acc = model.evaluate(X_test, y_test)
+print(f"\n✅ Test Accuracy: {test_acc:.4f} | Test Loss: {test_loss:.4f}")
+
+# --- Plot training history ---
+plt.figure(figsize=(12, 5))
+
+# Accuracy plot
+plt.subplot(1, 2, 1)
+plt.plot(history.history['accuracy'], label='Train Accuracy', marker='o')
+plt.plot(history.history['val_accuracy'], label='Validation Accuracy', marker='x')
+plt.title('Model Accuracy over Epochs')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.grid(True)
+plt.legend()
+
+# Loss plot
+plt.subplot(1, 2, 2)
+plt.plot(history.history['loss'], label='Train Loss', marker='o')
+plt.plot(history.history['val_loss'], label='Validation Loss', marker='x')
+plt.title('Model Loss over Epochs')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.grid(True)
+plt.legend()
+
+plt.tight_layout()
+plt.show()
