@@ -8,76 +8,148 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 import tensorflow as tf
 from tensorflow.keras import layers, models, optimizers
 import matplotlib.pyplot as plt
+from math import radians, sin, cos, sqrt, atan2  # Import necessary math functions for haversine
 
 # --- Hyperparameters ---
 EPOCHS = 10
-BATCH_SIZE = 32
+BATCH_SIZE = 8
 LEARNING_RATE = 0.001
 
 # --- Load dataset ---
+# This dataset should now include the 'RecommendedFriends' column from the unsupervised script
 df = pd.read_csv("SocialMediaUsers_with_Recommendations.csv")
 
 # --- TF-IDF on Interests ---
+# Ensure 'Interests' column is handled for potential NaNs before TF-IDF
 tfidf = TfidfVectorizer(max_features=100)
 X_tfidf = tfidf.fit_transform(df['Interests'].fillna(""))
 
+
+# --- Helper function for Haversine distance ---
+def haversine_distance_calc(lat1, lon1, lat2, lon2):
+    R = 6371  # Radius of Earth in kilometers
+
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+
+    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+
+    distance = R * c
+    return distance
+
+
 # --- Feature engineering functions ---
 def interest_similarity(u1, u2):
+    """
+    Calculates cosine similarity between interests of two users.
+    """
     return cosine_similarity(X_tfidf[u1], X_tfidf[u2])[0, 0]
 
+
 def age_difference(u1, u2):
+    """
+    Calculates the absolute age difference between two users.
+    """
+    # Ensure 'age' column is numeric and handle potential NaNs if not already done by unsupervised script
+    # This assumes 'age' is already correctly calculated and filled by the unsupervised script.
     return abs(df.loc[u1, 'age'] - df.loc[u2, 'age'])
 
+
 def geo_distance(u1, u2):
+    """
+    Calculates the geographical distance between two users using the Haversine formula.
+    This replaces the simple Euclidean distance.
+    """
     lat1, lon1 = df.loc[u1, ['latitude', 'longitude']]
     lat2, lon2 = df.loc[u2, ['latitude', 'longitude']]
-    return np.sqrt((lat1 - lat2)**2 + (lon1 - lon2)**2)
+    return haversine_distance_calc(lat1, lon1, lat2, lon2)
+
 
 # --- Generate training data ---
 samples = []
 labels = []
-n_samples = 20000
-random.seed(42)
+n_samples = 20000  # Number of samples to generate for training
+random.seed(42)  # For reproducibility
+
+# Ensure 'RecommendedFriends' column is treated as string to handle potential NaNs or non-string entries
+df['RecommendedFriends'] = df['RecommendedFriends'].astype(str)
 
 for _ in range(n_samples):
-    # Positive pair
+    # Positive pair generation
     u1 = random.randint(0, len(df) - 1)
-    friends_str = str(df.loc[u1, 'RecommendedFriends'])
-    friend_names = [name.strip() for name in friends_str.split(',') if name.strip()]
+    # Safely get friend names, handling 'nan' string if no recommendations were found
+    friends_str = df.loc[u1, 'RecommendedFriends']
+    friend_names = [name.strip() for name in friends_str.split(',') if name.strip() and name.strip().lower() != 'nan']
+
     if friend_names:
         try:
-            u2 = df[df['Name'].isin(friend_names)].sample(1).index[0]
-            samples.append([interest_similarity(u1, u2), age_difference(u1, u2), geo_distance(u1, u2)])
-            labels.append(1)
-        except:
-            continue
+            # Randomly select one recommended friend from the list
+            # Ensure the selected friend name exists in the DataFrame's 'Name' column
+            possible_friends_df = df[df['Name'].isin(friend_names)]
+            if not possible_friends_df.empty:
+                u2 = possible_friends_df.sample(1).index[0]
+                samples.append([interest_similarity(u1, u2), age_difference(u1, u2), geo_distance(u1, u2)])
+                labels.append(1)
+            else:
+                # Fallback if selected friend name from RecommendedFriends isn't found in df
+                # This could happen if names are inconsistent or filtered out elsewhere.
+                continue
+        except Exception as e:
+            # print(f"Error generating positive pair for user {u1}: {e}")
+            continue  # Skip this sample if an error occurs
 
-    # Negative pair
+    # Negative pair generation
+    # Ensure u1 and u2 are different and u2 is not a recommended friend of u1
     u1 = random.randint(0, len(df) - 1)
     u2 = random.randint(0, len(df) - 1)
-    if u1 != u2 and df.loc[u2, 'Name'] not in str(df.loc[u1, 'RecommendedFriends']):
+
+    # Get recommended friends for u1 for negative sampling check
+    u1_friends_str = df.loc[u1, 'RecommendedFriends']
+    u1_friend_names = [name.strip() for name in u1_friends_str.split(',') if
+                       name.strip() and name.strip().lower() != 'nan']
+
+    # Check if u1 and u2 are different users AND u2's name is NOT in u1's recommended friends list
+    if u1 != u2 and df.loc[u2, 'Name'] not in u1_friend_names:
         samples.append([interest_similarity(u1, u2), age_difference(u1, u2), geo_distance(u1, u2)])
         labels.append(0)
+    else:
+        # If they are the same user or u2 is already a recommended friend, skip this iteration
+        continue
 
 # --- Prepare dataset ---
+# Convert lists to numpy arrays
 X = np.array(samples)
 y = np.array(labels)
 
+# Check if X is empty before scaling (can happen if data generation fails to find enough samples)
+if X.shape[0] == 0:
+    print("Error: No samples generated for training. Check data or generation logic.")
+    exit()
+
+# Scale features
 scaler = StandardScaler()
 X = scaler.fit_transform(X)
 
+# Split data into training and testing sets
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
 # --- Build neural network model ---
 model = models.Sequential([
-    layers.Input(shape=(3,)),
-    layers.Dense(32, activation='relu'),
-    layers.Dense(16, activation='relu'),
-    layers.Dense(1, activation='sigmoid')
+    layers.Input(shape=(3,)),  # Input shape corresponds to 3 features: interest_sim, age_diff, geo_dist
+    layers.Dense(32, activation='relu'),  # First hidden layer with 32 units and ReLU activation
+    layers.Dense(16, activation='relu'),  # Second hidden layer with 16 units and ReLU activation
+    layers.Dense(1, activation='sigmoid')  # Output layer with 1 unit and sigmoid for binary classification
 ])
 
+# Configure the optimizer and compile the model
 optimizer = optimizers.Adam(learning_rate=LEARNING_RATE)
 model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy'])
+
+# Print model summary to show architecture and parameter count
+model.summary()
 
 # --- Train the model ---
 print(f"\nTraining model with epochs={EPOCHS}, batch_size={BATCH_SIZE}, learning_rate={LEARNING_RATE}")
@@ -85,12 +157,12 @@ history = model.fit(
     X_train, y_train,
     epochs=EPOCHS,
     batch_size=BATCH_SIZE,
-    validation_split=0.1,
-    verbose=1
+    validation_split=0.1,  # Use 10% of training data for validation during training
+    verbose=1  # Show training progress
 )
 
 # --- Evaluate the model ---
-test_loss, test_acc = model.evaluate(X_test, y_test)
+test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)  # Evaluate on the held-out test set
 print(f"\n✅ Test Accuracy: {test_acc:.4f} | Test Loss: {test_loss:.4f}")
 
 # --- Plot training history ---
@@ -116,5 +188,5 @@ plt.ylabel('Loss')
 plt.grid(True)
 plt.legend()
 
-plt.tight_layout()
-plt.show()
+plt.tight_layout()  # Adjust layout to prevent labels from overlapping
+plt.show()  # Display the plots
