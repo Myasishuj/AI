@@ -6,9 +6,12 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
+from math import radians, sin, cos, sqrt, atan2
+
 
 # --- Helpers ---
 def normalize(s: str) -> str:
+    """Normalizes string by removing accents, lowercasing, and stripping whitespace."""
     return (
         unicodedata.normalize("NFKD", s)
         .encode("ascii", "ignore")
@@ -17,8 +20,28 @@ def normalize(s: str) -> str:
         .strip()
     )
 
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """
+    Calculate the distance between two points on Earth using the Haversine formula.
+    Parameters are in degrees, returns distance in kilometers.
+    """
+    R = 6371  # Radius of Earth in kilometers
+
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+
+    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+
+    distance = R * c
+    return distance
+
+
 # --- 1. Load and preprocess data ---
-INPUT_CSV = "SocialMediaUsersDataset_with_all_coordinates.csv"
+INPUT_CSV = "SocialMediaUsersDataset_with_coordinates.csv"
 try:
     df = pd.read_csv(INPUT_CSV)
     print(f"Loaded '{INPUT_CSV}'. Shape: {df.shape}")
@@ -40,11 +63,27 @@ if USE_SAMPLE:
 
 # Age from DOB
 df['DOB'] = pd.to_datetime(df['DOB'], errors='coerce')
-calculated_age = ((pd.Timestamp(datetime.now()) - df['DOB']).dt.days / 365.25)
-df['age'] = calculated_age.fillna(calculated_age.mean() if not calculated_age.isnull().all() else 0)
+# Calculate age based on current date
+current_date = pd.Timestamp(datetime.now())
+
+# Calculate age for all entries. If DOB is NaT, this will result in NaN for age.
+calculated_age_series = (current_date - df['DOB']).dt.days / 365.25
+
+# Assign the calculated ages to the 'age' column. This creates the column if it doesn't exist.
+df['age'] = calculated_age_series
+
+# Fill any NaNs in the newly created 'age' column.
+# These NaNs would come from rows where 'DOB' was NaT (due to errors='coerce').
+if df['age'].isnull().any():
+    # Calculate mean only from non-NaN calculated ages
+    mean_age = calculated_age_series.mean()
+    # If all calculated_age_series are NaN, mean_age will be NaN. Handle this by using 0.
+    fill_value = mean_age if not pd.isna(mean_age) else 0
+    df['age'] = df['age'].fillna(fill_value)
+
 print(f"Age calculated. Range: {df['age'].min():.2f}–{df['age'].max():.2f}")
 
-# Coordinates
+# Coordinates - fill NaNs with mean
 df['latitude'] = df['latitude'].fillna(df['latitude'].mean() if not df['latitude'].isnull().all() else 0.0)
 df['longitude'] = df['longitude'].fillna(df['longitude'].mean() if not df['longitude'].isnull().all() else 0.0)
 coords = df[['latitude', 'longitude']].values
@@ -60,56 +99,102 @@ X_text = tfidf.fit_transform(interests)
 numeric_scaler = StandardScaler()
 X_num = numeric_scaler.fit_transform(np.column_stack([df['age'].values.reshape(-1, 1), coords]))
 
+# Combine features. You could add weights here if desired, e.g., X_text * 1.0, X_num * 2.0
 X_combined = np.hstack([X_text.toarray(), X_num])
 pca = PCA(n_components=50)
 X_reduced = pca.fit_transform(X_combined)
 
 # --- 3. NearestNeighbors model ---
-n_neighbors = 3
-nn_model = NearestNeighbors(n_neighbors=n_neighbors + 1, metric='cosine')
+n_neighbors = 3  # Number of neighbors to find (excluding self)
+nn_model = NearestNeighbors(n_neighbors=n_neighbors + 1, metric='cosine')  # +1 to include self
 nn_model.fit(X_reduced)
 distances, indices = nn_model.kneighbors(X_reduced)
 
+
 # --- 4. Friend recommendation function ---
-def get_friend_recommendations(user_id, num_recommendations=3, initial_threshold=0.85, min_threshold=0.70, step=0.05):
+def get_friend_recommendations(user_id, num_recommendations=10, initial_threshold=0.85, min_threshold=0.75, step=0.05,
+                               max_geo_distance_km=500):
+    """
+    Generates friend recommendations for a given user, applying similarity and geographical filters.
+
+    Args:
+        user_id (int): The ID of the user for whom to find recommendations.
+        num_recommendations (int): Desired number of recommendations.
+        initial_threshold (float): Starting similarity threshold.
+        min_threshold (float): Minimum similarity threshold to try.
+        step (float): Step to decrease threshold if not enough recommendations are found.
+        max_geo_distance_km (float): Maximum allowed geographical distance in kilometers
+                                     between users for a recommendation to be valid.
+
+    Returns:
+        list: A list of tuples (recommended_friend_name, similarity_score).
+    """
     if user_id < 0 or user_id >= len(df):
+        print(f"Warning: Invalid user_id {user_id}. Returning empty recommendations.")
         return []
 
     user_distances = distances[user_id]
     user_indices = indices[user_id]
 
+    user_lat, user_lon = df.loc[user_id, ['latitude', 'longitude']]
+
     current_threshold = initial_threshold
+
+    # Attempt to find recommendations by gradually lowering the similarity threshold
     while current_threshold >= min_threshold:
         recs = []
-        for i in range(1, len(user_indices)):  # skip self (index 0)
+        for i in range(1, len(user_indices)):  # Skip self (index 0)
             neighbor_idx = user_indices[i]
-            similarity = 1 - user_distances[i]
-            if similarity >= current_threshold:
+            similarity = 1 - user_distances[i]  # Convert cosine distance to similarity
+
+            # Apply similarity threshold
+            if similarity < current_threshold:
+                continue  # Skip if not similar enough
+
+            # Apply geographical distance filter
+            neighbor_lat, neighbor_lon = df.loc[neighbor_idx, ['latitude', 'longitude']]
+            geo_dist = haversine_distance(user_lat, user_lon, neighbor_lat, neighbor_lon)
+
+            if geo_dist <= max_geo_distance_km:
                 recs.append((df.loc[neighbor_idx, 'Name'], similarity))
 
+        # If enough recommendations are found, sort and return
         if len(recs) >= num_recommendations:
             recs.sort(key=lambda x: x[1], reverse=True)
             return recs[:num_recommendations]
 
-        current_threshold -= step  # Lower the bar and retry
+        current_threshold -= step  # Lower the similarity threshold and retry
 
-    # Fallback: return top matches regardless of threshold
+    # Fallback: If not enough recommendations are found even after lowering the similarity
+    # threshold, return the best available matches that still meet the geographical constraint.
+    # This ensures some recommendations are always provided if possible.
     fallback_recs = []
     for i in range(1, len(user_indices)):
         neighbor_idx = user_indices[i]
         similarity = 1 - user_distances[i]
-        fallback_recs.append((df.loc[neighbor_idx, 'Name'], similarity))
+
+        neighbor_lat, neighbor_lon = df.loc[neighbor_idx, ['latitude', 'longitude']]
+        geo_dist = haversine_distance(user_lat, user_lon, neighbor_lat, neighbor_lon)
+
+        if geo_dist <= max_geo_distance_km:
+            fallback_recs.append((df.loc[neighbor_idx, 'Name'], similarity))
 
     fallback_recs.sort(key=lambda x: x[1], reverse=True)
-    return fallback_recs[:num_recommendations]
+    return fallback_recs[:num_recommendations]  # Return up to num_recommendations from filtered list
+
 
 # --- 5. Evaluate all users ---
 print("\n--- Evaluating all users ---")
 all_similarities = []
 recommendation_column = []
 
+# You can adjust max_geo_distance_km here for the overall evaluation
+# For example, if you want to ensure recommendations are within the same country or region,
+# set a reasonable distance. 500km is a common starting point for national/regional.
+GEOGRAPHICAL_FILTER_KM = 750
+
 for user_id in range(len(df)):
-    recs = get_friend_recommendations(user_id, num_recommendations=3)
+    recs = get_friend_recommendations(user_id, num_recommendations=5, max_geo_distance_km=GEOGRAPHICAL_FILTER_KM)
     recommended_names = [name for name, sim in recs]
     recommendation_column.append(", ".join(recommended_names))
 
@@ -117,9 +202,9 @@ for user_id in range(len(df)):
         sims = [sim for _, sim in recs]
         avg_sim = sum(sims) / len(sims)
         all_similarities.extend(sims)
-        print(f"User {df.loc[user_id, 'Name']} (ID {user_id}): Avg sim = {avg_sim:.3f}")
-    else:
-        print(f"User {df.loc[user_id, 'Name']} (ID {user_id}): No strong matches.")
+    #     print(f"User {df.loc[user_id, 'Name']} (ID {user_id}): Avg sim = {avg_sim:.3f} (Geo Filter: {GEOGRAPHICAL_FILTER_KM}km)")
+    # else:
+    #     print(f"User {df.loc[user_id, 'Name']} (ID {user_id}): No strong matches within {GEOGRAPHICAL_FILTER_KM}km.")
 
 # Add column
 df['RecommendedFriends'] = recommendation_column
@@ -127,14 +212,16 @@ df['RecommendedFriends'] = recommendation_column
 # --- 6. Print summary ---
 print("\n--- Summary ---")
 print(f"Evaluated {len(df)} users.")
-print(f"Similarity threshold: > 0.85")
+print(f"Similarity threshold: > 0.85 (with adaptive lowering to > {get_friend_recommendations.__defaults__[3]})")
+print(f"Geographical distance filter: <= {GEOGRAPHICAL_FILTER_KM} km")
 if all_similarities:
-    print(f"Overall average similarity: {np.mean(all_similarities):.3f}")
-    print(f"Similarity range: {min(all_similarities):.3f} – {max(all_similarities):.3f}")
+    print(f"Overall average similarity (filtered): {np.mean(all_similarities):.3f}")
+    print(f"Similarity range (filtered): {min(all_similarities):.3f} – {max(all_similarities):.3f}")
 else:
-    print("No similarities found above threshold.")
+    print("No similarities found above threshold and within geographical filter.")
 
 # --- 7. Save updated dataset ---
 OUTPUT_CSV = "SocialMediaUsers_with_Recommendations.csv"
 df.to_csv(OUTPUT_CSV, index=False)
 print(f"Saved updated DataFrame to '{OUTPUT_CSV}'")
+
