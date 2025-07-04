@@ -40,6 +40,39 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     return distance
 
 
+def calculate_simple_midpoint(lat1, lon1, lat2, lon2):
+    """
+    Calculates a simple geographical midpoint (average of lat/lon) between two points.
+    For more accuracy over long distances, a spherical midpoint formula would be needed.
+    """
+    mid_lat = (lat1 + lat2) / 2
+    mid_lon = (lon1 + lon2) / 2
+    return mid_lat, mid_lon
+
+
+def get_location_name_from_coords(lat, lon):
+    """
+    Illustrative placeholder for reverse geocoding to get a human-readable location name (city/town).
+    In a real application, this would involve an API call (e.g., Google Maps Geocoding API, Nominatim).
+    This version provides more specific city names for common regions based on simplified ranges.
+    """
+    # Example of a more specific, hardcoded lookup for demonstration purposes
+    # In reality, you'd use a robust reverse geocoding library or API.
+    # Coordinates are approximate for illustration.
+    if 48.15 < lat < 48.16 and 17.86 < lon < 17.87:
+        return "Šaľa, Slovakia"
+    elif 44.71 < lat < 44.72 and 25.31 < lon < 25.32:
+        return "Găești, Romania"
+    elif 44.48 < lat < 44.49 and 11.21 < lon < 11.22:
+        return "Zola Predosa, Italy"
+    elif 48.6 < lat < 48.7 and 22.2 < lon < 22.3:
+        return "Uzhhorod, Ukraine"  # Near the border
+    elif 48.0 < lat < 49.0 and 17.0 < lon < 18.0:  # Broader Bratislava area
+        return "Bratislava Area, Slovakia"
+    else:
+        return f"Near ({lat:.2f}, {lon:.2f})"  # Fallback for unknown regions
+
+
 # --- 1. Load and preprocess data ---
 INPUT_CSV = "SocialMediaUsersDataset_with_coordinates.csv"
 try:
@@ -63,21 +96,11 @@ if USE_SAMPLE:
 
 # Age from DOB
 df['DOB'] = pd.to_datetime(df['DOB'], errors='coerce')
-# Calculate age based on current date
 current_date = pd.Timestamp(datetime.now())
-
-# Calculate age for all entries. If DOB is NaT, this will result in NaN for age.
 calculated_age_series = (current_date - df['DOB']).dt.days / 365.25
-
-# Assign the calculated ages to the 'age' column. This creates the column if it doesn't exist.
 df['age'] = calculated_age_series
-
-# Fill any NaNs in the newly created 'age' column.
-# These NaNs would come from rows where 'DOB' was NaT (due to errors='coerce').
 if df['age'].isnull().any():
-    # Calculate mean only from non-NaN calculated ages
     mean_age = calculated_age_series.mean()
-    # If all calculated_age_series are NaN, mean_age will be NaN. Handle this by using 0.
     fill_value = mean_age if not pd.isna(mean_age) else 0
     df['age'] = df['age'].fillna(fill_value)
 
@@ -113,9 +136,10 @@ distances, indices = nn_model.kneighbors(X_reduced)
 
 # --- 4. Friend recommendation function ---
 def get_friend_recommendations(user_id, num_recommendations=10, initial_threshold=0.85, min_threshold=0.75, step=0.05,
-                               max_geo_distance_km=500):
+                               max_geo_distance_km=750):
     """
     Generates friend recommendations for a given user, applying similarity and geographical filters.
+    Also calculates the midpoint and suggests a meetup location for each recommended pair.
 
     Args:
         user_id (int): The ID of the user for whom to find recommendations.
@@ -127,7 +151,12 @@ def get_friend_recommendations(user_id, num_recommendations=10, initial_threshol
                                      between users for a recommendation to be valid.
 
     Returns:
-        list: A list of tuples (recommended_friend_name, similarity_score).
+        list: A list of dictionaries, each containing:
+              'name': recommended_friend_name,
+              'similarity': similarity_score,
+              'midpoint_lat': latitude of the midpoint,
+              'midpoint_lon': longitude of the midpoint,
+              'suggested_location': a human-readable name for the midpoint's location
     """
     if user_id < 0 or user_id >= len(df):
         print(f"Warning: Invalid user_id {user_id}. Returning empty recommendations.")
@@ -156,11 +185,19 @@ def get_friend_recommendations(user_id, num_recommendations=10, initial_threshol
             geo_dist = haversine_distance(user_lat, user_lon, neighbor_lat, neighbor_lon)
 
             if geo_dist <= max_geo_distance_km:
-                recs.append((df.loc[neighbor_idx, 'Name'], similarity))
+                mid_lat, mid_lon = calculate_simple_midpoint(user_lat, user_lon, neighbor_lat, neighbor_lon)
+                suggested_loc = get_location_name_from_coords(mid_lat, mid_lon)  # Get location name
+                recs.append({
+                    'name': df.loc[neighbor_idx, 'Name'],
+                    'similarity': similarity,
+                    'midpoint_lat': mid_lat,
+                    'midpoint_lon': mid_lon,
+                    'suggested_location': suggested_loc
+                })
 
         # If enough recommendations are found, sort and return
         if len(recs) >= num_recommendations:
-            recs.sort(key=lambda x: x[1], reverse=True)
+            recs.sort(key=lambda x: x['similarity'], reverse=True)
             return recs[:num_recommendations]
 
         current_threshold -= step  # Lower the similarity threshold and retry
@@ -177,9 +214,17 @@ def get_friend_recommendations(user_id, num_recommendations=10, initial_threshol
         geo_dist = haversine_distance(user_lat, user_lon, neighbor_lat, neighbor_lon)
 
         if geo_dist <= max_geo_distance_km:
-            fallback_recs.append((df.loc[neighbor_idx, 'Name'], similarity))
+            mid_lat, mid_lon = calculate_simple_midpoint(user_lat, user_lon, neighbor_lat, neighbor_lon)
+            suggested_loc = get_location_name_from_coords(mid_lat, mid_lon)  # Get location name
+            fallback_recs.append({
+                'name': df.loc[neighbor_idx, 'Name'],
+                'similarity': similarity,
+                'midpoint_lat': mid_lat,
+                'midpoint_lon': mid_lon,
+                'suggested_location': suggested_loc
+            })
 
-    fallback_recs.sort(key=lambda x: x[1], reverse=True)
+    fallback_recs.sort(key=lambda x: x['similarity'], reverse=True)
     return fallback_recs[:num_recommendations]  # Return up to num_recommendations from filtered list
 
 
@@ -187,27 +232,48 @@ def get_friend_recommendations(user_id, num_recommendations=10, initial_threshol
 print("\n--- Evaluating all users ---")
 all_similarities = []
 recommendation_column = []
+midpoint_lat_column = []
+midpoint_lon_column = []
+meetup_location_column = []  # New column for meetup location
 
 # You can adjust max_geo_distance_km here for the overall evaluation
 # For example, if you want to ensure recommendations are within the same country or region,
 # set a reasonable distance. 500km is a common starting point for national/regional.
-GEOGRAPHICAL_FILTER_KM = 750
+GEOGRAPHICAL_FILTER_KM = 750  # Increased default for broader regional recommendations
 
 for user_id in range(len(df)):
     recs = get_friend_recommendations(user_id, num_recommendations=5, max_geo_distance_km=GEOGRAPHICAL_FILTER_KM)
-    recommended_names = [name for name, sim in recs]
-    recommendation_column.append(", ".join(recommended_names))
+
+    recommended_names = []
+    midpoints_lat = []
+    midpoints_lon = []
+    meetup_locations = []
 
     if recs:
-        sims = [sim for _, sim in recs]
+        sims = [r['similarity'] for r in recs]
         avg_sim = sum(sims) / len(sims)
         all_similarities.extend(sims)
-    #     print(f"User {df.loc[user_id, 'Name']} (ID {user_id}): Avg sim = {avg_sim:.3f} (Geo Filter: {GEOGRAPHICAL_FILTER_KM}km)")
-    # else:
-    #     print(f"User {df.loc[user_id, 'Name']} (ID {user_id}): No strong matches within {GEOGRAPHICAL_FILTER_KM}km.")
 
-# Add column
+        for r in recs:
+            recommended_names.append(r['name'])
+            midpoints_lat.append(r['midpoint_lat'])
+            midpoints_lon.append(r['midpoint_lon'])
+            meetup_locations.append(r['suggested_location'])  # Collect suggested location
+
+        # print(f"User {df.loc[user_id, 'Name']} (ID {user_id}): Avg sim = {avg_sim:.3f} (Geo Filter: {GEOGRAPHICAL_FILTER_KM}km)")
+    # else:
+    # print(f"User {df.loc[user_id, 'Name']} (ID {user_id}): No strong matches within {GEOGRAPHICAL_FILTER_KM}km.")
+
+    recommendation_column.append(", ".join(recommended_names))
+    midpoint_lat_column.append(", ".join(map(str, midpoints_lat)))  # Store as comma-separated string
+    midpoint_lon_column.append(", ".join(map(str, midpoints_lon)))  # Store as comma-separated string
+    meetup_location_column.append(", ".join(meetup_locations))  # Store as comma-separated string
+
+# Add columns
 df['RecommendedFriends'] = recommendation_column
+df['RecommendedFriendMidpointLat'] = midpoint_lat_column
+df['RecommendedFriendMidpointLon'] = midpoint_lon_column
+df['RecommendedFriendMeetupLocation'] = meetup_location_column  # Add new column
 
 # --- 6. Print summary ---
 print("\n--- Summary ---")
@@ -224,4 +290,3 @@ else:
 OUTPUT_CSV = "SocialMediaUsers_with_Recommendations.csv"
 df.to_csv(OUTPUT_CSV, index=False)
 print(f"Saved updated DataFrame to '{OUTPUT_CSV}'")
-
