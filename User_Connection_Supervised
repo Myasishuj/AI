@@ -9,14 +9,15 @@ import tensorflow as tf
 from tensorflow.keras import layers, models, optimizers
 import matplotlib.pyplot as plt
 from math import radians, sin, cos, sqrt, atan2  # Import necessary math functions for haversine
+from sklearn.metrics import classification_report, confusion_matrix, roc_curve, auc
 
 # --- Hyperparameters ---
-EPOCHS = 10
-BATCH_SIZE = 8
+EPOCHS = 10  # IMPORTANT: Set back to 10 as per your request
+BATCH_SIZE = 32
 LEARNING_RATE = 0.001
 
 # --- Load dataset ---
-# This dataset should now include the 'RecommendedFriends' column from the unsupervised script
+# This dataset should now include the 'RecommendedFriends', 'RecommendedFriendMidpointLat', 'RecommendedFriendMidpointLon' columns
 df = pd.read_csv("SocialMediaUsers_with_Recommendations.csv")
 
 # --- TF-IDF on Interests ---
@@ -27,6 +28,10 @@ X_tfidf = tfidf.fit_transform(df['Interests'].fillna(""))
 
 # --- Helper function for Haversine distance ---
 def haversine_distance_calc(lat1, lon1, lat2, lon2):
+    """
+    Calculate the distance between two points on Earth (specified by latitude and longitude)
+    using the Haversine formula. Returns distance in kilometers.
+    """
     R = 6371  # Radius of Earth in kilometers
 
     lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
@@ -53,15 +58,12 @@ def age_difference(u1, u2):
     """
     Calculates the absolute age difference between two users.
     """
-    # Ensure 'age' column is numeric and handle potential NaNs if not already done by unsupervised script
-    # This assumes 'age' is already correctly calculated and filled by the unsupervised script.
     return abs(df.loc[u1, 'age'] - df.loc[u2, 'age'])
 
 
 def geo_distance(u1, u2):
     """
     Calculates the geographical distance between two users using the Haversine formula.
-    This replaces the simple Euclidean distance.
     """
     lat1, lon1 = df.loc[u1, ['latitude', 'longitude']]
     lat2, lon2 = df.loc[u2, ['latitude', 'longitude']]
@@ -80,6 +82,7 @@ df['RecommendedFriends'] = df['RecommendedFriends'].astype(str)
 for _ in range(n_samples):
     # Positive pair generation
     u1 = random.randint(0, len(df) - 1)
+
     # Safely get friend names, handling 'nan' string if no recommendations were found
     friends_str = df.loc[u1, 'RecommendedFriends']
     friend_names = [name.strip() for name in friends_str.split(',') if name.strip() and name.strip().lower() != 'nan']
@@ -87,68 +90,54 @@ for _ in range(n_samples):
     if friend_names:
         try:
             # Randomly select one recommended friend from the list
-            # Ensure the selected friend name exists in the DataFrame's 'Name' column
             possible_friends_df = df[df['Name'].isin(friend_names)]
             if not possible_friends_df.empty:
                 u2 = possible_friends_df.sample(1).index[0]
                 samples.append([interest_similarity(u1, u2), age_difference(u1, u2), geo_distance(u1, u2)])
                 labels.append(1)
             else:
-                # Fallback if selected friend name from RecommendedFriends isn't found in df
-                # This could happen if names are inconsistent or filtered out elsewhere.
                 continue
         except Exception as e:
-            # print(f"Error generating positive pair for user {u1}: {e}")
-            continue  # Skip this sample if an error occurs
+            continue
 
     # Negative pair generation
-    # Ensure u1 and u2 are different and u2 is not a recommended friend of u1
     u1 = random.randint(0, len(df) - 1)
     u2 = random.randint(0, len(df) - 1)
 
-    # Get recommended friends for u1 for negative sampling check
     u1_friends_str = df.loc[u1, 'RecommendedFriends']
     u1_friend_names = [name.strip() for name in u1_friends_str.split(',') if
                        name.strip() and name.strip().lower() != 'nan']
 
-    # Check if u1 and u2 are different users AND u2's name is NOT in u1's recommended friends list
     if u1 != u2 and df.loc[u2, 'Name'] not in u1_friend_names:
         samples.append([interest_similarity(u1, u2), age_difference(u1, u2), geo_distance(u1, u2)])
         labels.append(0)
     else:
-        # If they are the same user or u2 is already a recommended friend, skip this iteration
         continue
 
 # --- Prepare dataset ---
-# Convert lists to numpy arrays
 X = np.array(samples)
 y = np.array(labels)
 
-# Check if X is empty before scaling (can happen if data generation fails to find enough samples)
 if X.shape[0] == 0:
     print("Error: No samples generated for training. Check data or generation logic.")
     exit()
 
-# Scale features
 scaler = StandardScaler()
 X = scaler.fit_transform(X)
 
-# Split data into training and testing sets
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
 # --- Build neural network model ---
 model = models.Sequential([
-    layers.Input(shape=(3,)),  # Input shape corresponds to 3 features: interest_sim, age_diff, geo_dist
-    layers.Dense(32, activation='relu'),  # First hidden layer with 32 units and ReLU activation
-    layers.Dense(16, activation='relu'),  # Second hidden layer with 16 units and ReLU activation
-    layers.Dense(1, activation='sigmoid')  # Output layer with 1 unit and sigmoid for binary classification
+    layers.Input(shape=(3,)),
+    layers.Dense(32, activation='relu'),
+    layers.Dense(16, activation='relu'),
+    layers.Dense(1, activation='sigmoid')
 ])
 
-# Configure the optimizer and compile the model
 optimizer = optimizers.Adam(learning_rate=LEARNING_RATE)
 model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy'])
 
-# Print model summary to show architecture and parameter count
 model.summary()
 
 # --- Train the model ---
@@ -157,13 +146,31 @@ history = model.fit(
     X_train, y_train,
     epochs=EPOCHS,
     batch_size=BATCH_SIZE,
-    validation_split=0.1,  # Use 10% of training data for validation during training
-    verbose=1  # Show training progress
+    validation_split=0.1,
+    verbose=1
 )
 
 # --- Evaluate the model ---
-test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)  # Evaluate on the held-out test set
+test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)
 print(f"\n✅ Test Accuracy: {test_acc:.4f} | Test Loss: {test_loss:.4f}")
+
+# --- Generate additional evaluation metrics ---
+# Predict probabilities on the test set
+y_pred_proba = model.predict(X_test)
+# Convert probabilities to binary predictions using a threshold (e.g., 0.5)
+y_pred = (y_pred_proba > 0.5).astype(int)
+
+print("\n--- Classification Report ---")
+print(classification_report(y_test, y_pred))
+
+print("\n--- Confusion Matrix ---")
+print(confusion_matrix(y_test, y_pred))
+
+# Calculate ROC curve and AUC
+fpr, tpr, thresholds = roc_curve(y_test, y_pred_proba)
+roc_auc = auc(fpr, tpr)
+
+print(f"\n--- AUC Score: {roc_auc:.4f} ---")
 
 # --- Plot training history ---
 plt.figure(figsize=(12, 5))
@@ -188,5 +195,197 @@ plt.ylabel('Loss')
 plt.grid(True)
 plt.legend()
 
-plt.tight_layout()  # Adjust layout to prevent labels from overlapping
+plt.tight_layout()
 plt.show()  # Display the plots
+plt.close('all')  # Close all plot windows to allow script to continue
+
+# --- Plot ROC Curve ---
+plt.figure(figsize=(8, 6))
+plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Receiver Operating Characteristic (ROC) Curve')
+plt.legend(loc="lower right")
+plt.grid(True)
+plt.show()  # Display the plots
+plt.close('all')  # Close all plot windows to allow script to continue
+
+# --- START: New Outputs for Similarity Matrix and Top N Recommendations ---
+
+print("\n--- Generating predictions for all user pairs (Similarity Matrix) ---")
+# Create a list of all unique user IDs (indices in the DataFrame)
+all_user_ids = df.index.tolist()
+
+# Create a list to store all possible unique pairs of users (u1, u2)
+# We use u1 < u2 to avoid duplicate pairs (e.g., (0,1) and (1,0)) and self-pairs (e.g., (0,0))
+all_user_pairs = [(i, j) for i in all_user_ids for j in all_user_ids if i < j]
+
+# Prepare features for all these pairs
+features_for_prediction = []
+for u1, u2 in all_user_pairs:
+    # Calculate the three features for each pair using the defined functions
+    sim = interest_similarity(u1, u2)
+    age_d = age_difference(u1, u2)
+    geo_d = geo_distance(u1, u2)
+    features_for_prediction.append([sim, age_d, geo_d])
+
+# Convert the list of features into a NumPy array
+features_for_prediction_np = np.array(features_for_prediction)
+
+# Standardize the features using the *same* scaler that was fitted on the training data.
+# This is crucial to ensure consistency in scaling between training and prediction.
+# Handle case where features_for_prediction_np might be empty if all_user_pairs is empty
+if features_for_prediction_np.size > 0:
+    features_scaled_for_prediction = scaler.transform(features_for_prediction_np)
+
+    # Make predictions using the trained model.
+    # .flatten() converts the 2D array of predictions into a 1D array.
+    predictions = model.predict(features_scaled_for_prediction).flatten()
+
+    # Create a Pandas DataFrame to store the recommendations. This serves as the "Similarity Matrix".
+    recommendations_df = pd.DataFrame({
+        'user1_id': [pair[0] for pair in all_user_pairs],  # User ID of the first person in the pair
+        'user2_id': [pair[1] for pair in all_user_pairs],  # User ID of the second person in the pair
+        'connection_probability': predictions  # The predicted probability of a connection
+    })
+
+    # Save the DataFrame to a new CSV file.
+    # index=False prevents Pandas from writing the DataFrame index as a column in the CSV.
+    output_similarity_matrix_csv = "user_predictions_similarity_matrix.csv"
+    recommendations_df.to_csv(output_similarity_matrix_csv, index=False)
+    print(f"✅ Predictions (Similarity Matrix) saved to {output_similarity_matrix_csv}")
+else:
+    print("No user pairs generated for similarity matrix. Skipping saving.")
+    recommendations_df = pd.DataFrame()  # Initialize empty DataFrame
+
+print("\n--- Generating Top N Recommendations for example users ---")
+N_TOP_RECOMMENDATIONS = 5  # Define how many top recommendations to show per user
+
+# Get a few example user IDs to demonstrate top N recommendations
+# Ensure these IDs are valid within your DataFrame's index
+example_user_ids = [0, 1, 2, 3, 4]
+# Filter out any example_user_ids that are not in the DataFrame index
+example_user_ids = [uid for uid in example_user_ids if uid in df.index]
+
+if not recommendations_df.empty:
+    for user_id in example_user_ids:
+        # Filter recommendations_df for pairs involving the current user_id
+        # We need to consider both user1_id and user2_id columns
+        user_recs = recommendations_df[
+            (recommendations_df['user1_id'] == user_id) | (recommendations_df['user2_id'] == user_id)
+            ].copy()  # Use .copy() to avoid SettingWithCopyWarning
+
+        # Determine the 'other' user in the pair and their name
+        user_recs['other_user_id'] = user_recs.apply(
+            lambda row: row['user2_id'] if row['user1_id'] == user_id else row['user1_id'],
+            axis=1
+        )
+
+        # Exclude self-recommendations (though the initial pair generation should prevent this for i < j)
+        user_recs = user_recs[user_recs['other_user_id'] != user_id]
+
+        # Get the name of the 'other' user
+        user_recs['other_user_name'] = user_recs['other_user_id'].apply(
+            lambda other_id: df.loc[other_id, 'Name'] if other_id in df.index else 'Unknown'
+        )
+
+        # Sort by connection probability in descending order
+        top_n_recs = user_recs.sort_values(by='connection_probability', ascending=False).head(N_TOP_RECOMMENDATIONS)
+
+        print(f"\nTop {N_TOP_RECOMMENDATIONS} Recommendations for User {df.loc[user_id, 'Name']} (ID: {user_id}):")
+        if not top_n_recs.empty:
+            for index, row in top_n_recs.iterrows():
+                print(
+                    f"  - {row['other_user_name']} (ID: {row['other_user_id']}): Probability = {row['connection_probability']:.4f}")
+        else:
+            print("  No recommendations found for this user.")
+else:
+    print("\nSkipping Top N Recommendations: Similarity Matrix (recommendations_df) is empty.")
+
+# --- END: New Outputs for Similarity Matrix and Top N Recommendations ---
+
+
+# --- Example of how to access and use midpoint information after supervised prediction ---
+# This part is for demonstration and would typically be in a separate application logic
+# where you use the trained model to make predictions and then suggest meetups.
+
+# Let's assume you have a pair of users (e.g., user_id_A and user_id_B)
+# for whom the supervised model has predicted a high connection probability.
+# You can retrieve their midpoint information from the DataFrame generated by the unsupervised script.
+
+# Example: Get midpoint for the first user's first recommended friend (if any)
+if not df.empty and 'RecommendedFriendMidpointLat' in df.columns and 'RecommendedFriendMidpointLon' in df.columns:
+    try:
+        # We'll try to find a recommended friend for user 0 and display their meetup location
+        first_user_id = 0
+
+        # Ensure first_user_id is a valid index
+        if first_user_id not in df.index:
+            print(f"\nUser ID {first_user_id} not found in DataFrame. Cannot demonstrate midpoint info.")
+        else:
+            # Get the recommended friends for the first user from the original df
+            # This will be a comma-separated string of names
+            recommended_friends_names_str = df.loc[first_user_id, 'RecommendedFriends']
+
+            if recommended_friends_names_str and recommended_friends_names_str.lower() != 'nan':
+                # Split the names and get the first one for demonstration
+                first_rec_friend_name = recommended_friends_names_str.split(',')[0].strip()
+
+                # Find the row in the original df that corresponds to this recommended friend
+                # This is to get their original index to match with the midpoint columns
+                first_rec_friend_id_list = df[df['Name'] == first_rec_friend_name].index.tolist()
+
+                if first_rec_friend_id_list:
+                    first_rec_friend_id = first_rec_friend_id_list[0]  # Get the first matching ID
+
+                    # Now, find the midpoint information for the pair (first_user_id, first_rec_friend_id)
+                    # This requires finding the specific entry in the recommendations_df that contains this pair
+                    # Note: recommendations_df stores pairs as (user1_id, user2_id) where user1_id < user2_id
+
+                    # Ensure the order for lookup in recommendations_df
+                    u_id1, u_id2 = sorted([first_user_id, first_rec_friend_id])
+
+                    # Find the row in recommendations_df that matches this sorted pair
+                    pair_info = recommendations_df[
+                        (recommendations_df['user1_id'] == u_id1) &
+                        (recommendations_df['user2_id'] == u_id2)
+                        ]
+
+                    if not pair_info.empty:
+                        # Retrieve midpoint and location from the original df for the first user's recommendation
+                        # Note: The midpoint and location are stored in df based on the unsupervised script's output
+                        midpoint_lat_str = df.loc[first_user_id, 'RecommendedFriendMidpointLat']
+                        midpoint_lon_str = df.loc[first_user_id, 'RecommendedFriendMidpointLon']
+                        meetup_location_str = df.loc[first_user_id, 'RecommendedFriendMeetupLocation']
+
+                        # Assuming these are comma-separated and we take the first one
+                        midpoint_lat_val = float(midpoint_lat_str.split(',')[0].strip())
+                        midpoint_lon_val = float(midpoint_lon_str.split(',')[0].strip())
+                        meetup_location_val = meetup_location_str.split(',')[0].strip()
+
+                        print(f"\n--- Meetup Location Suggestion (Post-Prediction) ---")
+                        print(
+                            f"For User {df.loc[first_user_id, 'Name']} (ID: {first_user_id}) and their recommended friend {first_rec_friend_name} (ID: {first_rec_friend_id}):")
+                        print(f"Predicted Connection Probability: {pair_info['connection_probability'].iloc[0]:.4f}")
+                        print(
+                            f"Suggested Meetup Midpoint: Latitude={midpoint_lat_val:.4f}, Longitude={midpoint_lon_val:.4f}")
+                        print(f"Suggested Meetup Location (from Unsupervised Model): {meetup_location_val}")
+                        print(
+                            "This midpoint and location could then be used to query a POI API (e.g., Google Places) to suggest actual venues.")
+                    else:
+                        print(
+                            f"\nNo prediction found for the pair ({first_user_id}, {first_rec_friend_id}) in recommendations_df.")
+                else:
+                    print(f"\nRecommended friend '{first_rec_friend_name}' not found in DataFrame for ID lookup.")
+            else:
+                print(
+                    f"\nNo recommended friends with midpoint information available for user {df.loc[first_user_id, 'Name']}'s recommendations.")
+    except Exception as e:
+        print(f"\nError accessing midpoint information for demonstration: {e}")
+else:
+    print("\nDataFrame is empty or midpoint/location columns are missing in the original DataFrame.")
+
+print("\nScript execution completed.")
